@@ -640,14 +640,33 @@ class MainActivity : AppCompatActivity() {
                 request: WebResourceRequest?
             ): Boolean {
                 val destUrl = request?.url.toString()
+                val scheme = request?.url?.scheme
+
                 // ✅ Explicit logout via real navigation → clear saved credentials for that
                 // login type only (security), same cleanup path as the JS click-fallback.
                 val logoutType = logoutTypeForUrl(destUrl)
                 if (logoutType != null) {
                     performLogoutCleanup(logoutType)
                 }
-                view?.loadUrl(destUrl)
-                return true
+
+                // ✅ PAYMENT FIX — normal http/https navigation ko WebView khud natively handle
+                // karne do (return false). Manually loadUrl(destUrl) call karna har navigation
+                // ko GET me convert kar deta tha, jisse fee-payment ke auto-submit POST forms
+                // (CCAvenue encRequest/access_code, pay-process fields) ka data hi drop ho jaata
+                // tha — isiliye payment browser me chalta tha par app me nahi.
+                if (scheme == "http" || scheme == "https") {
+                    return false
+                }
+
+                // ✅ Non-web schemes (upi://, intent://, tel:, mailto:) — kuch bank/payment
+                // pages UPI app handoff ya OTP app ke liye ye fire karte hain. System ko
+                // handle karne do.
+                return try {
+                    startActivity(Intent(Intent.ACTION_VIEW, request?.url))
+                    true
+                } catch (e: Exception) {
+                    true
+                }
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
@@ -782,6 +801,22 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     request?.grant(request.resources)
                 }
+            }
+
+            // ✅ PAYMENT GATEWAY FIX — bank ka OTP/3D-Secure verification page window.open() /
+            // target="_blank" se khulta hai. Bina isके WebView popup ko silently drop kar deta
+            // hai, isliye "Pay Now" ke baad kuch nahi hota tha. Ye popup ka content SAME
+            // visible WebView me route kar deta hai.
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: android.os.Message?
+            ): Boolean {
+                val transport = resultMsg?.obj as? WebView.WebViewTransport
+                transport?.webView = webView
+                resultMsg?.sendToTarget()
+                return true
             }
 
             override fun onShowFileChooser(
