@@ -32,19 +32,83 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import java.io.File
 import java.io.FileOutputStream
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
-        // true while MainActivity is alive (created + past the internet check), even if
-        // NoInternetActivity is currently on top of it. Lets NoInternetActivity's Retry
-        // just return to this same instance (same page, same session) instead of always
-        // creating a fresh MainActivity that reloads the site root.
         @Volatile
         var isAlive: Boolean = false
     }
+
+    // ✅ FIX #3 — RECEIPT/ID-CARD AUTO-PRINT NOT OPENING ON MOBILE APP
+    // Shared print-guard script, used both by the old evaluateJavascript() path
+    // (kept as a fallback) and by the new addDocumentStartJavaScript() path below,
+    // which is the actual fix. See onCreate() for the full explanation.
+    private val printGuardJs = """
+        (function() {
+            if (window.__printGuardAttached) return;
+            window.__printGuardAttached = true;
+
+            function hookWindow(win) {
+                try { win.print = function() { AndroidBridge.triggerPrint(); }; } catch (e) {}
+                try {
+                    if (win.document && win.document.execCommand) {
+                        var origExecCommand = win.document.execCommand.bind(win.document);
+                        win.document.execCommand = function(cmd) {
+                            // ✅ PRINT FIX — jQuery.print calls
+                            // execCommand("print") FIRST and only falls back to
+                            // win.print() if that returns false. Android WebView's
+                            // real execCommand("print") returns truthy without
+                            // actually printing anything, silently swallowing the
+                            // whole action before our win.print() hook above ever
+                            // runs. Forcing it to report failure here makes every
+                            // jQuery.print call (fees dues, id card, receipts,
+                            // certificates, etc.) fall through to our hook.
+                            if (typeof cmd === 'string' && cmd.toLowerCase() === 'print') {
+                                return false;
+                            }
+                            return origExecCommand.apply(win.document, arguments);
+                        };
+                    }
+                } catch (e) {}
+            }
+
+            hookWindow(window);
+
+            var observer = new MutationObserver(function(mutations) {
+                mutations.forEach(function(m) {
+                    if (!m.addedNodes) return;
+                    m.addedNodes.forEach(function(node) {
+                        if (node.tagName === 'IFRAME') {
+                            var tries = 0;
+                            var timer = setInterval(function() {
+                                tries++;
+                                try { if (node.contentWindow) hookWindow(node.contentWindow); } catch (e) {}
+                                if (tries > 30) clearInterval(timer);
+                            }, 10);
+                            node.addEventListener('load', function() {
+                                try { if (node.contentWindow) hookWindow(node.contentWindow); } catch (e) {}
+                            });
+                        }
+                    });
+                });
+            });
+
+            // Observer needs a document to attach to — guard for very early execution
+            // (this script can now run at document-start, before documentElement exists).
+            if (document.documentElement) {
+                observer.observe(document.documentElement, { childList: true, subtree: true });
+            } else {
+                document.addEventListener('DOMContentLoaded', function() {
+                    observer.observe(document.documentElement, { childList: true, subtree: true });
+                });
+            }
+        })();
+    """.trimIndent()
 
     private lateinit var webView: WebView
     private lateinit var swipeRefresh: SwipeRefreshLayout
@@ -52,13 +116,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var spinnerImage: ImageView
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
 
-    // ✅ PULL-TO-REFRESH GUARD — true whenever JS tells us ANY scrollable area on the page
-    // (outer page, a navbar drawer, a "Hostel" panel, or any future panel) is currently
-    // scrolled down (scrollTop > 0). SwipeRefreshLayout queries this live via
-    // setOnChildScrollUpCallback on every touch move, so there's no stale-flag race condition.
     private var canScrollUpJs = false
 
-    // ✅ CAMERA & MIC PERMISSION REQUEST
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             val allGranted = permissions.values.all { it }
@@ -67,7 +126,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    // ✅ CHECK INTERNET
     private fun isInternetAvailable(): Boolean {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
         val network = cm.activeNetwork ?: return false
@@ -76,7 +134,6 @@ class MainActivity : AppCompatActivity() {
                 capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
-    // ✅ SHOW SPINNER
     private val spinnerTimeoutHandler = Handler(Looper.getMainLooper())
     private val spinnerTimeoutRunnable = Runnable { hideSpinner() }
     private var spinnerCurrentlyVisible = false
@@ -88,20 +145,12 @@ class MainActivity : AppCompatActivity() {
         if (!spinnerCurrentlyVisible) {
             spinnerCurrentlyVisible = true
             spinnerTimeoutHandler.removeCallbacks(spinnerTimeoutRunnable)
-            spinnerTimeoutHandler.postDelayed(spinnerTimeoutRunnable, 12000) // 12s max, from first show
+            spinnerTimeoutHandler.postDelayed(spinnerTimeoutRunnable, 12000)
         }
     }
 
-    // ✅ AUTO-LOGIN — tracks which login types we've already silently auto-submitted this
-    // app session. Synchronized because logout cleanup now touches this directly from the
-    // JS-bridge call thread (not queued via runOnUiThread) to close a race with the very
-    // next page load — see performLogoutCleanup / clearCredentialsForLogout below.
     private val autoLoginAttempted = java.util.Collections.synchronizedSet(mutableSetOf<LoginType>())
 
-    // ✅ Tracks which login type is CURRENTLY logged in, persisted across app restarts (not
-    // just in-memory) — set the moment a login is confirmed successful, and consulted on
-    // logout (both the URL-based path and the JS click-fallback) so we flush EXACTLY that
-    // one type's credentials instead of guessing / clearing both.
     private fun setLastLoggedInType(type: LoginType) {
         getSharedPreferences("app_session_prefs", MODE_PRIVATE).edit()
             .putString("last_logged_in_type", type.name)
@@ -118,15 +167,10 @@ class MainActivity : AppCompatActivity() {
             .apply()
     }
 
-    // Nothing is written to disk until success is confirmed — this way a wrong/old password
-    // typed by mistake never overwrites a previously-saved good one.
     private var pendingLoginType: LoginType? = null
     private var pendingEmail: String? = null
     private var pendingPassword: String? = null
 
-    // ✅ Remembers which login type (Student/Admin) the user last successfully logged in
-    // with, persisted across app restarts. Used right after app launch to know WHICH button
-    // to auto-click on a "choose Student or Admin" selection page.
     private fun saveLastLoginType(type: LoginType) {
         getSharedPreferences("app_prefs", MODE_PRIVATE).edit()
             .putString("last_login_type", type.name).apply()
@@ -141,26 +185,15 @@ class MainActivity : AppCompatActivity() {
             .remove("last_login_type").apply()
     }
 
-    // ✅ Confines the risky "search this page for a Student/Admin button and click it"
-    // behavior to ONLY the very first page shown after the app launches.
     private var initialAutoLoginTried = false
 
     private var lastLoadFailed = false
     private var autoRetryCount = 0
     private val MAX_AUTO_RETRIES = 2
 
-    // ✅ Cancellable "settle then hide spinner" timer. Previously this was a bare
-    // webView.postDelayed(..., 300) with no reference kept — so on a CHAINED navigation
-    // (selection page auto-clicked → credential page auto-filled+submitted → homepage, all
-    // within ~150-300ms of each other) the FIRST page's delayed hide would still fire ~300ms
-    // after ITS finish, landing in the middle of the NEXT page's load and hiding the spinner
-    // early. That's exactly what exposed the credential page / mid-load flash the user kept
-    // seeing. Now every onPageStarted cancels any pending hide from the previous page, so the
-    // spinner only ever comes down once the LATEST page in the chain has actually settled.
     private val postFinishHandler = Handler(Looper.getMainLooper())
     private var postFinishHideRunnable: Runnable? = null
 
-    // ✅ HIDE SPINNER
     private fun hideSpinner() {
         loadingLayout.visibility = View.GONE
         spinnerImage.clearAnimation()
@@ -171,11 +204,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ BLOB DOWNLOAD FIX — pages that generate files client-side (e.g. jsPDF's
-    // `pdf.save("Id-card.pdf")`) create a Blob and trigger it via a hidden
-    // <a download href="blob:...">. Android's DownloadManager can only handle http/https
-    // URIs, so handing it a blob: URL throws immediately ("could not handle URI"). The actual
-    // bytes are fetched back out via JS (see setDownloadListener below) and written here.
     private fun saveBase64ToDownloads(base64Data: String, filename: String, mimeType: String) {
         try {
             val bytes = Base64.decode(base64Data, Base64.DEFAULT)
@@ -209,10 +237,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ ID CARD FIX — WebView has no built-in window.print() support, so the site's
-    // jQuery.print plugin silently does nothing when the "ID Card" button is tapped. This
-    // triggers Android's native Print Framework instead, which lets the user save the card
-    // as a PDF (acts as the "download") or send it to an actual printer.
     private fun printCurrentPage() {
         if (!::webView.isInitialized) return
         val printManager = getSystemService(Context.PRINT_SERVICE) as? PrintManager
@@ -224,50 +248,38 @@ class MainActivity : AppCompatActivity() {
         val printAdapter = webView.createPrintDocumentAdapter(jobName)
         printManager.print(jobName, printAdapter, PrintAttributes.Builder().build())
     }
+    private val documentExtensions = setOf("pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "zip", "rar")
 
-    // ✅ jQuery.print (used by the ID card page) builds a hidden <iframe> and calls print()
-    // on the IFRAME's window, not the top-level page window — so a plain "override
-    // window.print" only catches direct callers and misses this plugin entirely. This watches
-    // for any iframe getting inserted and hooks ITS contentWindow.print too, as early as
-    // possible after the node appears (a short poll, since document.write() into the iframe
-    // happens right after insertion and could otherwise race the hook).
-    private fun injectPrintGuard(view: WebView?) {
-        val js = """
-            (function() {
-                if (window.__printGuardAttached) return;
-                window.__printGuardAttached = true;
-
-                function hookWindow(win) {
-                    try { win.print = function() { AndroidBridge.triggerPrint(); }; } catch (e) {}
-                }
-
-                hookWindow(window);
-
-                var observer = new MutationObserver(function(mutations) {
-                    mutations.forEach(function(m) {
-                        if (!m.addedNodes) return;
-                        m.addedNodes.forEach(function(node) {
-                            if (node.tagName === 'IFRAME') {
-                                var tries = 0;
-                                var timer = setInterval(function() {
-                                    tries++;
-                                    try { if (node.contentWindow) hookWindow(node.contentWindow); } catch (e) {}
-                                    if (tries > 30) clearInterval(timer);
-                                }, 10);
-                                node.addEventListener('load', function() {
-                                    try { if (node.contentWindow) hookWindow(node.contentWindow); } catch (e) {}
-                                });
-                            }
-                        });
-                    });
-                });
-                observer.observe(document.documentElement, { childList: true, subtree: true });
-            })();
-        """.trimIndent()
-        view?.evaluateJavascript(js, null)
+    private fun isDocumentUrl(url: String): Boolean {
+        val path = try { Uri.parse(url).path ?: "" } catch (e: Exception) { "" }
+        val ext = path.substringAfterLast('.', "").lowercase()
+        return ext in documentExtensions
     }
 
-    // ✅ exact real routes
+    private fun downloadDocument(url: String) {
+        try {
+            val fileName = URLUtil.guessFileName(url, null, null)
+            val request = DownloadManager.Request(Uri.parse(url))
+            request.addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url))
+            request.setDescription("Downloading file...")
+            request.setTitle(fileName)
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, fileName)
+            val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            dm.enqueue(request)
+            Toast.makeText(this, "Downloading: $fileName", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Download failed: ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // ✅ Now just delegates to the shared printGuardJs constant (see field above).
+    // Kept as a fallback path for onPageStarted/onPageFinished — the real fix is
+    // the addDocumentStartJavaScript() registration in onCreate() below.
+    private fun injectPrintGuard(view: WebView?) {
+        view?.evaluateJavascript(printGuardJs, null)
+    }
+
     private fun loginTypeForUrl(url: String?): LoginType? {
         if (url == null) return null
         val uri = try { Uri.parse(url) } catch (e: Exception) { null }
@@ -290,27 +302,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ THE CRITICAL PART — wipes CredentialStore + the "who's logged in" prefs.
-    // Deliberately NOT wrapped in runOnUiThread: SharedPreferences reads/writes (which is
-    // what CredentialStore and the last-logged-in-type prefs use) are documented thread-safe
-    // from any thread. This matters because the JS logout-click detector calls into
-    // AndroidBridge SYNCHRONOUSLY — the JS thread blocks until this Kotlin call returns —
-    // and only THEN does the browser continue on to the link's default navigation (or the
-    // site's own AJAX logout handler). If we instead posted this work to the UI thread via
-    // runOnUiThread (as before), the method returned immediately, JS carried on to navigate
-    // to the next page, and that next page's onPageFinished could run its auto-login check
-    // BEFORE the queued cleanup actually executed — a real race that let auto-login silently
-    // fire again right after logout. Doing it synchronously here closes that race.
     private fun clearCredentialsForLogout(type: LoginType?) {
         if (type != null) {
-            // we know exactly which account logged out — clear only that one, leave the
-            // other type's saved credentials untouched.
             CredentialStore.clear(this@MainActivity, type)
             autoLoginAttempted.remove(type)
         } else {
-            // we genuinely don't know which type was active (shouldn't normally happen once
-            // setLastLoggedInType is being set on every successful login) — fall back to
-            // clearing both, since leaving stale credentials behind is the worse outcome.
             CredentialStore.clear(this@MainActivity, LoginType.ADMIN)
             CredentialStore.clear(this@MainActivity, LoginType.STUDENT)
             autoLoginAttempted.clear()
@@ -318,22 +314,30 @@ class MainActivity : AppCompatActivity() {
         clearLastLoginType()
         clearLastLoggedInType()
     }
+    private var cookieWipePending = false
 
-    // ✅ Central place to actually wipe credentials for a logout — used by BOTH the
-    // URL-based logout detector and the JS click-fallback detector, so the "which type do
-    // we clear" decision lives in one spot instead of being duplicated/out-of-sync.
+    // ✅ FIX #2 — SCROLL-UP STUCK AFTER LOGOUT
+    // Pehle canScrollUpJs sirf NEXT page ke onPageStarted par reset hota tha. Agar user
+    // profile/kisi panel par scroll-down state me tha jab logout click kiya, wahi "true"
+    // value thodi der ke liye stale reh jaati thi (naye page ka pehla scroll event aane
+    // tak), isliye turant ke baad pull-to-refresh us naye (top par hi loaded) page par bhi
+    // "abhi scrolled down hai" samajh kar kaam nahi karta tha. Ab logout detect hote hi,
+    // yahin turant, scroll state ko force reset kar dete hain — onPageStarted ka reset to
+    // hai hi, ye sirf us gap ko band karta hai.
+    // NOTE: ye JS-bridge / non-UI thread se bhi call ho sakta hai (onLogoutClicked), isliye
+    // runOnUiThread zaroori hai kyunki canScrollUpJs UI thread (SwipeRefreshLayout) par
+    // read hota hai.
     private fun performLogoutCleanup(type: LoginType?) {
         clearCredentialsForLogout(type)
-        // Cookie clearing isn't part of the auto-login race (auto-login only checks
-        // CredentialStore, not cookies), so it's fine for this part to happen slightly
-        // later on the UI thread, which is where CookieManager is meant to be driven from.
         runOnUiThread {
-            CookieManager.getInstance().removeAllCookies(null)
-            CookieManager.getInstance().flush()
+            canScrollUpJs = false
+            if (::swipeRefresh.isInitialized) {
+                swipeRefresh.isRefreshing = false
+            }
         }
+        cookieWipePending = true
     }
 
-    // ✅ SILENT AUTO-LOGIN — fills fields and submits IMMEDIATELY (no artificial delay)
     private fun injectAutoLogin(view: WebView?, type: LoginType) {
         val savedEmail = CredentialStore.getEmail(this, type).replace("\\", "\\\\").replace("'", "\\'")
         val savedPassword = CredentialStore.getPassword(this, type).replace("\\", "\\\\").replace("'", "\\'")
@@ -371,9 +375,6 @@ class MainActivity : AppCompatActivity() {
         view?.evaluateJavascript(js, null)
     }
 
-    // ✅ Selection page has real class names, use them primarily. Only called when explicitly
-    // invoked (currently unused since the selection page is always shown manually — kept for
-    // future use / manual invocation if needed).
     private fun injectAutoLoginTypeSelector(view: WebView?, type: LoginType) {
         val cssClass = if (type == LoginType.STUDENT) "btn-student" else "btn-admin"
         val label = if (type == LoginType.STUDENT) "student" else "admin"
@@ -401,7 +402,6 @@ class MainActivity : AppCompatActivity() {
         view?.evaluateJavascript(js, null)
     }
 
-    // ✅ AUTO-FILL SAVED EMAIL/PASSWORD ON LOGIN PAGE (admin/student kept separate)
     private fun injectAutoFill(view: WebView?, type: LoginType) {
         if (!CredentialStore.hasSavedCredentials(this, type)) return
 
@@ -425,7 +425,6 @@ class MainActivity : AppCompatActivity() {
         view?.evaluateJavascript(js, null)
     }
 
-    // ✅ CAPTURE EMAIL/PASSWORD WHEN LOGIN FORM IS SUBMITTED
     private fun injectFormCapture(view: WebView?, type: LoginType) {
         val js = """
             (function() {
@@ -451,7 +450,6 @@ class MainActivity : AppCompatActivity() {
         view?.evaluateJavascript(js, null)
     }
 
-    // ✅ match by class "dud-logout" (real button), plus keep old checks as fallback
     private fun injectLogoutGuard(view: WebView?) {
         val js = """
         (function() {
@@ -477,7 +475,6 @@ class MainActivity : AppCompatActivity() {
         view?.evaluateJavascript(js, null)
     }
 
-    // ✅ NESTED-SCROLL GUARD (v3 — scroll-event based, not touch-guess based)
     private fun injectNestedScrollGuard(view: WebView?) {
         val js = """
             (function() {
@@ -502,11 +499,36 @@ class MainActivity : AppCompatActivity() {
                 window.addEventListener('scroll', function() {
                     report(window.scrollY);
                 }, true);
+
+                // ✅ report current state immediately on attach, so a page that loads
+                // already scrolled (rare) or a stale reading gets corrected right away
+                // instead of waiting for the user's first scroll gesture.
+                report((document.scrollingElement || document.documentElement).scrollTop);
             })();
         """.trimIndent()
 
         view?.evaluateJavascript(js, null)
     }
+
+
+    private fun injectLoginScrollFix(view: WebView?) {
+        val js = """
+        (function() {
+            if (window.__loginScrollFixAttached) return;
+            window.__loginScrollFixAttached = true;
+            var style = document.createElement('style');
+            style.textContent = 
+                'html, body { height: auto !important; min-height: 100% !important; overflow-y: auto !important; }' +
+                '.auth-wrapper { position: relative !important; min-height: 100vh !important; display: flex !important; align-items: center !important; justify-content: center !important; padding: 24px 0 !important; box-sizing: border-box !important; }' +
+                '.auth-wrapper .auth-content { position: static !important; left: auto !important; top: auto !important; transform: none !important; margin: 0 auto !important; max-width: 92vw !important; }';
+            document.head.appendChild(style);
+        })();
+    """.trimIndent()
+        view?.evaluateJavascript(js, null)
+    }
+
+
+
 
     @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -552,6 +574,22 @@ class MainActivity : AppCompatActivity() {
             saveFormData = false
         }
 
+        // ✅ FIX #3 — RECEIPT/ID-CARD AUTO-PRINT NOT OPENING ON MOBILE APP
+        // Root cause: injectPrintGuard() was previously only called via evaluateJavascript()
+        // inside onPageStarted/onPageFinished. onPageStarted fires before the new document
+        // actually exists, so that injection races the page's own auto-print script
+        // (e.g. window.onload -> window.print()) and frequently loses — the page's script
+        // calls WebView's real, silent, do-nothing window.print() before our hook attaches.
+        // onPageFinished is worse: by then the page already finished loading, so any
+        // onload-triggered auto-print already fired (or failed) before we ever injected.
+        // addDocumentStartJavaScript (androidx.webkit) guarantees our hook runs before ANY
+        // page script, on every single navigation, eliminating the race entirely — this is
+        // exactly what the browser gets "for free" since it has no injection-timing gap.
+        // Requires androidx.webkit:webkit dependency in app/build.gradle.
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            WebViewCompat.addDocumentStartJavaScript(webView, printGuardJs, setOf("*"))
+        }
+
         webView.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
 
         webView.scrollBarStyle = WebView.SCROLLBARS_INSIDE_OVERLAY
@@ -586,15 +624,8 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // ✅ Called from the JS logout-click detector (see injectLogoutGuard). Now clears
-            // ONLY the currently-logged-in type (tracked via setLastLoggedInType, set the
-            // moment a login is confirmed) instead of wiping both accounts blindly.
             @JavascriptInterface
             fun onLogoutClicked() {
-                // NOT wrapped in runOnUiThread on purpose — see clearCredentialsForLogout's
-                // comment. The JS click handler is blocked on this call, so credentials are
-                // guaranteed cleared before it returns control to the page (and any
-                // resulting navigation).
                 performLogoutCleanup(getLastLoggedInType())
             }
 
@@ -613,18 +644,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // ✅ Called from injectPrintGuard when the page (or its jQuery.print iframe)
-            // calls print() — hands off to Android's native Print Framework since WebView
-            // itself has no print support.
             @JavascriptInterface
             fun triggerPrint() {
                 runOnUiThread {
                     printCurrentPage()
                 }
             }
-            // ✅ Called from setDownloadListener's blob-fetch script with the file's actual
-            // bytes (base64-encoded), since the blob: URL itself can't be handed to
-            // DownloadManager.
             @JavascriptInterface
             fun saveBase64File(base64Data: String, filename: String, mimeType: String) {
                 Thread { saveBase64ToDownloads(base64Data, filename, mimeType) }.start()
@@ -642,25 +667,22 @@ class MainActivity : AppCompatActivity() {
                 val destUrl = request?.url.toString()
                 val scheme = request?.url?.scheme
 
-                // ✅ Explicit logout via real navigation → clear saved credentials for that
-                // login type only (security), same cleanup path as the JS click-fallback.
                 val logoutType = logoutTypeForUrl(destUrl)
                 if (logoutType != null) {
                     performLogoutCleanup(logoutType)
                 }
-
-                // ✅ PAYMENT FIX — normal http/https navigation ko WebView khud natively handle
-                // karne do (return false). Manually loadUrl(destUrl) call karna har navigation
-                // ko GET me convert kar deta tha, jisse fee-payment ke auto-submit POST forms
-                // (CCAvenue encRequest/access_code, pay-process fields) ka data hi drop ho jaata
-                // tha — isiliye payment browser me chalta tha par app me nahi.
                 if (scheme == "http" || scheme == "https") {
+                    if (isDocumentUrl(destUrl)) {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, request.url))
+                        } catch (e: Exception) {
+                            Toast.makeText(this@MainActivity, "Could not open link", Toast.LENGTH_SHORT).show()
+                        }
+                        return true
+                    }
                     return false
                 }
 
-                // ✅ Non-web schemes (upi://, intent://, tel:, mailto:) — kuch bank/payment
-                // pages UPI app handoff ya OTP app ke liye ye fire karte hain. System ko
-                // handle karne do.
                 return try {
                     startActivity(Intent(Intent.ACTION_VIEW, request?.url))
                     true
@@ -674,19 +696,19 @@ class MainActivity : AppCompatActivity() {
                 isMainFrameFinished = false
                 currentMainFrameLoadFailed = false
                 canScrollUpJs = false
-                // cancel any still-pending "hide spinner" from a previous page in a chained
-                // navigation (selector page → credential page → home) so it can't fire in
-                // the middle of THIS new page's load and expose it before it's ready
                 postFinishHideRunnable?.let { postFinishHandler.removeCallbacks(it) }
                 showSpinner()
-                // ✅ Attach the print hook as early as possible — before this page's own
-                // scripts (e.g. the ID card's jQuery.print call) have a chance to run.
                 injectPrintGuard(view)
             }
 
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
                 if (isMainFrameFinished) return
+                if (cookieWipePending) {
+                    cookieWipePending = false
+                    CookieManager.getInstance().removeAllCookies(null)
+                    CookieManager.getInstance().flush()
+                }
                 if (currentMainFrameLoadFailed) {
                     return
                 }
@@ -697,16 +719,25 @@ class MainActivity : AppCompatActivity() {
                 injectLogoutGuard(view)
                 injectPrintGuard(view)
 
+                val currentType = loginTypeForUrl(url)
+
+                val willAutoSubmit = currentType != null &&
+                        CredentialStore.hasSavedCredentials(this@MainActivity, currentType) &&
+                        !autoLoginAttempted.contains(currentType)
+
                 postFinishHideRunnable = Runnable {
                     hideSpinner()
                     swipeRefresh.isRefreshing = false
                     CookieManager.getInstance().flush()
                 }
-                postFinishHandler.postDelayed(postFinishHideRunnable!!, 1500)
+                postFinishHandler.postDelayed(
+                    postFinishHideRunnable!!,
+                    if (willAutoSubmit) 6000L else 1500L
+                )
 
-                val currentType = loginTypeForUrl(url)
                 if (currentType != null) {
                     initialAutoLoginTried = true
+                    injectLoginScrollFix(view)
 
                     if (pendingLoginType == currentType) {
                         pendingLoginType = null
@@ -722,22 +753,15 @@ class MainActivity : AppCompatActivity() {
                     """.trimIndent(), null)
 
                     injectFormCapture(view, currentType)
-                    if (CredentialStore.hasSavedCredentials(this@MainActivity, currentType) &&
-                        !autoLoginAttempted.contains(currentType)) {
-                        // ✅ credentials already saved for this type → fill + submit instantly,
-                        // no visible credential page (spinner stays up through the chain)
+                    if (willAutoSubmit) {
                         injectAutoLogin(view, currentType)
                     } else {
                         injectAutoFill(view, currentType)
                     }
                 } else {
-                    // ✅ Always show the Student/Admin selection page — let user pick manually
                     if (!initialAutoLoginTried) {
                         initialAutoLoginTried = true
                     }
-                    // ✅ Navigated AWAY from a login page — a pending submit means login
-                    // SUCCEEDED, so persist it now, AND record it as the currently-logged-in
-                    // type so a later logout knows exactly which one to flush.
                     val pType = pendingLoginType
                     val pEmail = pendingEmail
                     val pPass = pendingPassword
@@ -802,22 +826,33 @@ class MainActivity : AppCompatActivity() {
                     request?.grant(request.resources)
                 }
             }
-
-            // ✅ PAYMENT GATEWAY FIX — bank ka OTP/3D-Secure verification page window.open() /
-            // target="_blank" se khulta hai. Bina isके WebView popup ko silently drop kar deta
-            // hai, isliye "Pay Now" ke baad kuch nahi hota tha. Ye popup ka content SAME
-            // visible WebView me route kar deta hai.
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,
                 isUserGesture: Boolean,
                 resultMsg: android.os.Message?
             ): Boolean {
+                val popupWebView = WebView(this@MainActivity)   // 👈 "this" ki jagah "this@MainActivity"
+                popupWebView.settings.javaScriptEnabled = true
+                popupWebView.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(
+                        popupView: WebView?,
+                        request: WebResourceRequest?
+                    ): Boolean {
+                        val popupUrl = request?.url?.toString()
+                        if (popupUrl != null) {
+                            webView.loadUrl(popupUrl)
+                        }
+                        popupWebView.destroy()
+                        return true
+                    }
+                }
                 val transport = resultMsg?.obj as? WebView.WebViewTransport
-                transport?.webView = webView
+                transport?.webView = popupWebView
                 resultMsg?.sendToTarget()
                 return true
             }
+
 
             override fun onShowFileChooser(
                 webView: WebView?,
@@ -849,9 +884,6 @@ class MainActivity : AppCompatActivity() {
         webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             val fileName = URLUtil.guessFileName(url, contentDisposition, mimeType)
             if (url.startsWith("blob:")) {
-                // ✅ DownloadManager can't take a blob: URL — pull the actual bytes back out
-                // via JS (still running in the same page/document that owns the blob) and
-                // hand them to saveBase64File instead.
                 val safeMime = if (mimeType.isNullOrBlank()) "application/octet-stream" else mimeType
                 val js = """
                     (function() {
@@ -929,7 +961,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-    } // ✅ END OF onCreate
+    }
 
     private fun requestCameraAndMicPermissions() {
         val permissions = mutableListOf<String>()
@@ -1001,4 +1033,4 @@ class MainActivity : AppCompatActivity() {
         isAlive = false
     }
 
-} // ✅ END OF CLASS
+}
