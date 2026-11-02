@@ -44,10 +44,6 @@ class MainActivity : AppCompatActivity() {
         var isAlive: Boolean = false
     }
 
-    // ✅ FIX #3 — RECEIPT/ID-CARD AUTO-PRINT NOT OPENING ON MOBILE APP
-    // Shared print-guard script, used both by the old evaluateJavascript() path
-    // (kept as a fallback) and by the new addDocumentStartJavaScript() path below,
-    // which is the actual fix. See onCreate() for the full explanation.
     private val printGuardJs = """
         (function() {
             if (window.__printGuardAttached) return;
@@ -125,6 +121,25 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this, "Camera/Mic permission denied", Toast.LENGTH_SHORT).show()
             }
         }
+
+    private var geoCallback: GeolocationPermissions.Callback? = null
+    private var geoOrigin: String? = null
+
+    private val locationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            val granted = permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                    permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+            geoCallback?.invoke(geoOrigin, granted, false)
+            geoCallback = null
+            geoOrigin = null
+            if (!granted) {
+                Toast.makeText(this, "Location permission denied", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_FINE_LOCATION) == PERMISSION_GRANTED ||
+                ContextCompat.checkSelfPermission(this, android.Manifest.permission.ACCESS_COARSE_LOCATION) == PERMISSION_GRANTED
 
     private fun isInternetAvailable(): Boolean {
         val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -273,9 +288,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ✅ Now just delegates to the shared printGuardJs constant (see field above).
-    // Kept as a fallback path for onPageStarted/onPageFinished — the real fix is
-    // the addDocumentStartJavaScript() registration in onCreate() below.
     private fun injectPrintGuard(view: WebView?) {
         view?.evaluateJavascript(printGuardJs, null)
     }
@@ -316,17 +328,6 @@ class MainActivity : AppCompatActivity() {
     }
     private var cookieWipePending = false
 
-    // ✅ FIX #2 — SCROLL-UP STUCK AFTER LOGOUT
-    // Pehle canScrollUpJs sirf NEXT page ke onPageStarted par reset hota tha. Agar user
-    // profile/kisi panel par scroll-down state me tha jab logout click kiya, wahi "true"
-    // value thodi der ke liye stale reh jaati thi (naye page ka pehla scroll event aane
-    // tak), isliye turant ke baad pull-to-refresh us naye (top par hi loaded) page par bhi
-    // "abhi scrolled down hai" samajh kar kaam nahi karta tha. Ab logout detect hote hi,
-    // yahin turant, scroll state ko force reset kar dete hain — onPageStarted ka reset to
-    // hai hi, ye sirf us gap ko band karta hai.
-    // NOTE: ye JS-bridge / non-UI thread se bhi call ho sakta hai (onLogoutClicked), isliye
-    // runOnUiThread zaroori hai kyunki canScrollUpJs UI thread (SwipeRefreshLayout) par
-    // read hota hai.
     private fun performLogoutCleanup(type: LoginType?) {
         clearCredentialsForLogout(type)
         runOnUiThread {
@@ -568,24 +569,14 @@ class MainActivity : AppCompatActivity() {
             builtInZoomControls = false
             displayZoomControls = false
             javaScriptCanOpenWindowsAutomatically = true
+            setGeolocationEnabled(true)
             setSupportMultipleWindows(true)
             mediaPlaybackRequiresUserGesture = false
             @Suppress("DEPRECATION")
             saveFormData = false
         }
 
-        // ✅ FIX #3 — RECEIPT/ID-CARD AUTO-PRINT NOT OPENING ON MOBILE APP
-        // Root cause: injectPrintGuard() was previously only called via evaluateJavascript()
-        // inside onPageStarted/onPageFinished. onPageStarted fires before the new document
-        // actually exists, so that injection races the page's own auto-print script
-        // (e.g. window.onload -> window.print()) and frequently loses — the page's script
-        // calls WebView's real, silent, do-nothing window.print() before our hook attaches.
-        // onPageFinished is worse: by then the page already finished loading, so any
-        // onload-triggered auto-print already fired (or failed) before we ever injected.
-        // addDocumentStartJavaScript (androidx.webkit) guarantees our hook runs before ANY
-        // page script, on every single navigation, eliminating the race entirely — this is
-        // exactly what the browser gets "for free" since it has no injection-timing gap.
-        // Requires androidx.webkit:webkit dependency in app/build.gradle.
+
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             WebViewCompat.addDocumentStartJavaScript(webView, printGuardJs, setOf("*"))
         }
@@ -826,6 +817,31 @@ class MainActivity : AppCompatActivity() {
                     request?.grant(request.resources)
                 }
             }
+            // 📍 Website jab location maange (navigator.geolocation) tab ye call hota hai
+            override fun onGeolocationPermissionsShowPrompt(
+                origin: String?,
+                callback: GeolocationPermissions.Callback?
+            ) {
+                if (hasLocationPermission()) {
+                    callback?.invoke(origin, true, false)
+                } else {
+                    geoCallback?.invoke(geoOrigin, false, false)
+                    geoCallback = callback
+                    geoOrigin = origin
+                    locationPermissionLauncher.launch(
+                        arrayOf(
+                            android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            android.Manifest.permission.ACCESS_COARSE_LOCATION
+                        )
+                    )
+                }
+            }
+
+            override fun onGeolocationPermissionsHidePrompt() {
+                geoCallback = null
+                geoOrigin = null
+            }
+
             override fun onCreateWindow(
                 view: WebView?,
                 isDialog: Boolean,

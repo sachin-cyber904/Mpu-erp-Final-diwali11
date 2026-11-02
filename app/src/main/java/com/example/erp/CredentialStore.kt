@@ -5,8 +5,7 @@ import android.content.SharedPreferences
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 
-// ✅ SECURELY SAVES EMAIL/PASSWORD LOCALLY — SEPARATE SLOTS FOR ADMIN AND STUDENT
-// so admin login credentials never overwrite/autofill the student login form, and vice versa.
+
 enum class LoginType {
     ADMIN,
     STUDENT
